@@ -1,0 +1,8 @@
+pyaudio
+webrtcvad
+websockets
+python-dotenv
+groq
+google-genai
+requests
+cartesia
