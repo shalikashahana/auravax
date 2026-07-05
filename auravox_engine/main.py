@@ -45,8 +45,9 @@ except ImportError:
 
 # --- AuraVox API client modules (assumed built & importable) ---------------
 try:
-    from api_clients import groq_stt
+    from api_clients import deepgram_stt
     from api_clients import gemini_translate
+    from api_clients import groq_translate
     from api_clients import cartesia_tts
 except ImportError as e:
     print(f"❌ Could not import api_clients package: {e}")
@@ -68,7 +69,7 @@ class Config:
     FRAME_BYTES = FRAME_SIZE * SAMPLE_WIDTH                     # bytes/frame
 
     VAD_AGGRESSIVENESS = 3        # 0 (lenient) - 3 (most aggressive filtering)
-    SILENCE_TIMEOUT_MS = 300      # cut chunk after this much trailing silence
+    SILENCE_TIMEOUT_MS = 1000     # 1s — matches natural sentence pause (0.8-1.2s)
     SILENCE_FRAMES = max(1, int(SILENCE_TIMEOUT_MS / FRAME_DURATION_MS))
 
     MIN_CHUNK_MS = 250            # ignore chunks shorter than this (noise/blips)
@@ -99,6 +100,41 @@ def log(msg: str) -> None:
 class AudioEngine:
     def __init__(self):
         self.pa = pyaudio.PyAudio()
+        self._detect_virtual_audio_cable()
+
+    def _detect_virtual_audio_cable(self) -> None:
+        """Scan audio devices for a Virtual Audio Cable output.
+
+        If a device whose name contains 'CABLE Output' or 'Virtual' is found,
+        Config.OUTPUT_DEVICE_INDEX is set to its index so that TTS audio is
+        routed through the virtual cable (Google Meet picks it up as a mic).
+        Falls back to the system default speaker if no match is found.
+        """
+        device_count = self.pa.get_device_count()
+        for i in range(device_count):
+            try:
+                info = self.pa.get_device_info_by_index(i)
+                name = info.get("name", "").lower()
+                max_output = info.get("maxOutputChannels", 0)
+
+                # Only consider devices that actually support output
+                if max_output < 1:
+                    continue
+
+                if "cable output" in name or "virtual" in name:
+                    Config.OUTPUT_DEVICE_INDEX = i
+                    log(f"🔌 Virtual Audio Cable detected: "
+                        f"\"{info['name']}\" (device index {i})")
+                    return
+            except Exception:
+                # Corrupt / unavailable device entry — skip silently
+                continue
+
+        # No virtual cable found — fall back to system default
+        Config.OUTPUT_DEVICE_INDEX = None
+        log("⚠️  No Virtual Audio Cable found (looked for 'CABLE Output' / "
+            "'Virtual'). Falling back to default speaker output. "
+            "Install VB-Cable for Google Meet routing.")
 
     def open_input_stream(self):
         return self.pa.open(
@@ -147,8 +183,8 @@ def process_chunk(chunk_id: int, audio_bytes: bytes,
     affecting other in-flight chunks or the capture loop.
     """
     try:
-        log(f"🚀 [chunk {chunk_id}] Sending to Groq STT...")
-        tamil_text = groq_stt.transcribe_audio_chunk(audio_bytes)
+        log(f"🚀 [chunk {chunk_id}] Sending to Deepgram STT...")
+        tamil_text = deepgram_stt.transcribe_audio_chunk(audio_bytes)
 
         if not tamil_text or not tamil_text.strip():
             log(f"🤔 [chunk {chunk_id}] No speech detected by STT — skipping.")
@@ -156,12 +192,22 @@ def process_chunk(chunk_id: int, audio_bytes: bytes,
         log(f"📝 [chunk {chunk_id}] Transcribed: \"{tamil_text.strip()}\"")
 
     except Exception as e:
-        log(f"❌ [chunk {chunk_id}] Groq STT failed: {e}")
+        log(f"❌ [chunk {chunk_id}] Deepgram STT failed: {e}")
         return
 
+    # --- Stage 2: Gemini Grammar Filter (optional pre-filter) ---------------
     try:
-        log(f"🌐 [chunk {chunk_id}] Translating + extracting emotion (Gemini)...")
-        result = gemini_translate.translate_and_extract_emotion(tamil_text)
+        log(f"🧹 [chunk {chunk_id}] Gemini grammar filter...")
+        cleaned_tamil = gemini_translate.gemini_grammar_filter(tamil_text)
+        log(f"✨ [chunk {chunk_id}] Cleaned: \"{cleaned_tamil.strip()}\"")
+    except Exception as e:
+        log(f"⚠️  [chunk {chunk_id}] Grammar filter error — using raw text: {e}")
+        cleaned_tamil = tamil_text
+
+    # --- Stage 3: Groq LLaMA Translation (Tamil → English) -----------------
+    try:
+        log(f"🌐 [chunk {chunk_id}] Translating (Groq LLaMA)...")
+        result = groq_translate.translate_and_extract_emotion(cleaned_tamil)
 
         translation = (result or {}).get("translation")
         emotion = (result or {}).get("emotion", "neutral")
@@ -173,7 +219,7 @@ def process_chunk(chunk_id: int, audio_bytes: bytes,
             f"(emotion: {emotion})")
 
     except Exception as e:
-        log(f"❌ [chunk {chunk_id}] Gemini translation failed: {e}")
+        log(f"❌ [chunk {chunk_id}] Groq translation failed: {e}")
         return
 
     try:
